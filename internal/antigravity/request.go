@@ -201,16 +201,14 @@ func clampMaxOutputTokens(req *GenerateContentRequest) {
 }
 
 func buildAntigravitySystemInstruction(existing *SystemInstruction) *SystemInstruction {
+	// PATCHED (local): when the client provides its own system instruction,
+	// pass it through unchanged instead of prepending the Antigravity CLI
+	// prompt. Falls back to the original behavior when none is provided.
+	if existing != nil {
+		return existing
+	}
 	parts := []ContentPart{
 		{Text: strings.TrimSpace(SystemInstructionText)},
-	}
-
-	if existing != nil {
-		for _, part := range existing.Parts {
-			if part.Text != "" {
-				parts = append(parts, ContentPart{Text: part.Text})
-			}
-		}
 	}
 
 	return &SystemInstruction{
