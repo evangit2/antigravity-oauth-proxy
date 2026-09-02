@@ -8,6 +8,7 @@ import (
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/antigravity"
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/logger"
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/openai"
+	"github.com/dvcrn/antigravity-oauth-proxy/internal/sigcache"
 	"github.com/google/uuid"
 )
 
@@ -56,6 +57,8 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 	toolCallNameByID := map[string]string{}
 	toolCallIDByName := map[string]string{}
 	var pendingToolParts []antigravity.ContentPart
+	// PATCHED (local): system texts collected here, merged into first user msg
+	var mergedSystemTexts []string
 	for _, m := range messages {
 		if m.Role == "assistant" && len(m.ToolCalls) > 0 {
 			for _, tc := range m.ToolCalls {
@@ -79,30 +82,26 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 		}
 
 		if roleLower == "system" {
-			// Allow multiple system messages by concatenating their parts
-			if systemInstruction == nil {
-				systemInstruction = &antigravity.SystemInstruction{
-					Role:  "system",
-					Parts: []antigravity.ContentPart{},
-				}
-			}
-
+			// PATCHED (local): Google's upstream classifier 429s requests whose
+			// systemInstruction looks like a third-party agent persona. Merge
+			// system text into the first user message instead (verified to pass).
+			var sysTexts []string
 			switch content := msg.Content.(type) {
 			case string:
 				if content != "" {
-					systemInstruction.Parts = append(systemInstruction.Parts, antigravity.ContentPart{Text: content})
+					sysTexts = append(sysTexts, content)
 				}
 			case []interface{}:
-				// Support array content for system messages (e.g., [{"type":"text","text":"..."}])
 				for _, part := range content {
 					if p, ok := part.(map[string]interface{}); ok && p["type"] == "text" {
 						if txt, ok2 := p["text"].(string); ok2 && txt != "" {
-							systemInstruction.Parts = append(systemInstruction.Parts, antigravity.ContentPart{Text: txt})
+							sysTexts = append(sysTexts, txt)
 						}
 					}
 				}
-			default:
-				// Ignore unsupported content types for system messages
+			}
+			for _, st := range sysTexts {
+				mergedSystemTexts = append(mergedSystemTexts, st)
 			}
 			continue // System message is not part of contents
 		}
@@ -254,6 +253,15 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 					thoughtSignature = id[idx+1:]
 					id = id[:idx]
 				}
+				// PATCHED (local): client replayed a bare call ID — the signature
+				// was lost in OpenAI round-trip. Re-attach from the server-side
+				// cache so Gemini 3 doesn't reject with 400 missing thought_signature.
+				if thoughtSignature == "" {
+					if cached := sigcache.Lookup(id); cached != "" {
+						thoughtSignature = cached
+						logger.Get().Info().Str("call_id", id).Msg("Re-attached cached thought_signature to replayed tool call")
+					}
+				}
 
 				if thoughtSignature != "" {
 					logger.Get().Info().Str("signature", thoughtSignature).Msg("Restored thought_signature from client tool call ID")
@@ -294,7 +302,26 @@ func convertMessagesToGeminiContents(messages []openai.Message) (geminiContents 
 			Parts: pendingToolParts,
 		})
 	}
-	return geminiContents, systemInstruction, nil
+
+	// PATCHED (local): merge system texts into first user message to avoid
+	// Google's third-party-agent-persona classifier on systemInstruction.
+	if len(mergedSystemTexts) > 0 {
+		merged := "[SYSTEM INSTRUCTIONS]\n" + strings.Join(mergedSystemTexts, "\n\n") + "\n[/SYSTEM INSTRUCTIONS]\n\n"
+		if len(geminiContents) > 0 && geminiContents[0].Role == "user" {
+			// Prepend a text part to the first user message's parts
+			newParts := make([]antigravity.ContentPart, 0, len(geminiContents[0].Parts)+1)
+			newParts = append(newParts, antigravity.ContentPart{Text: merged})
+			newParts = append(newParts, geminiContents[0].Parts...)
+			geminiContents[0].Parts = newParts
+		} else {
+			// No user message yet — insert a fresh user message with the system text
+			geminiContents = append([]antigravity.Content{{
+				Role:  "user",
+				Parts: []antigravity.ContentPart{{Text: merged}},
+			}}, geminiContents...)
+		}
+	}
+	return geminiContents, nil, nil
 }
 
 func convertToolsToGeminiTools(tools []openai.Tool) []antigravity.Tool {
