@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/logger"
+	"github.com/dvcrn/antigravity-oauth-proxy/internal/sigcache"
 	"github.com/google/uuid"
 )
 
@@ -166,6 +167,10 @@ func CreateOpenAIStreamTransformer(model string) func(<-chan StreamChunk) <-chan
 						callID := fmt.Sprintf("call_%s", uuid.New().String())
 						if funcCall.ThoughtSignature != "" {
 							logger.Get().Info().Str("signature", funcCall.ThoughtSignature).Msg("Extracted thought_signature from Gemini, appending to ID")
+							// PATCHED (local): also remember server-side keyed by the
+							// BARE id; clients replaying bare call IDs lose the |sig
+							// suffix, so we re-attach from this cache on the next request.
+							sigcache.Store(callID, funcCall.ThoughtSignature)
 							callID = callID + "|" + funcCall.ThoughtSignature
 						}
 						toolCallID = &callID
