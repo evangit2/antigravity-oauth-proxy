@@ -1,4 +1,18 @@
-# Google Antigravity Proxy
+# Google Antigravity Proxy (Hermes fork)
+
+> ## What's fixed in this fork
+>
+> This fork makes the proxy work with **Hermes Agent** and other OpenAI-compatible agents (Claude Code-style harnesses, OpenCode, etc.) that send their own long system prompts and make heavy use of tool calling. Upstream, both of those break:
+>
+> 1. **`429 RESOURCE_EXHAUSTED` on requests with long system prompts** — upstream injects the Antigravity CLI's prompt on top of yours and sends it as a separate `systemInstruction` field. Google's Cloud Code endpoint runs a classifier on system instructions that intermittently rejects agent-style system prompts (mid-stream, after 50–170s of thinking). **Fix:** pass the client's system instruction through untouched, and send it merged into the first user message as `[System Instructions] … [End System Instructions]` instead of the separate field. Deterministic 200s on requests that failed 100% upstream.
+>
+> 2. **`400 INVALID_ARGUMENT: Function call is missing a thought_signature`** — Gemini 3 models attach a `thoughtSignature` to function-call parts and require it echoed back on tool-result turns. The proxy's upstream round-trip loses it: it encodes the signature into the OpenAI `tool_call_id` (`call_<uuid>|<sig>`), but agents like Hermes strip/normalize those IDs before replaying them. **Fix:** a server-side signature cache (`internal/sigcache`) that stores signatures keyed by bare call ID when the model emits them, and re-attaches them when a client replays bare IDs. Persists to disk so restarts don't poison conversations.
+>
+> 3. **Opt-in request dumping** (`AOP_DUMP_REQUESTS=1`) — debugging aid for exactly this kind of bisect, off by default since it writes conversation content to disk.
+>
+> Full details + Hermes wiring: see [README-HERMES.md](README-HERMES.md).
+>
+> Everything else is unchanged from upstream. All fixes are self-contained and upstreamable.
 
 Proxy to expose the Antigravity API through standard APIs (Gemini, OpenAI) that you can plug into different tools such as OpenCode or Xcode
 
