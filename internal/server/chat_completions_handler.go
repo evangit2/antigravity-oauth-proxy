@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -27,6 +29,14 @@ func (s *Server) openAIChatCompletionsHandler(w http.ResponseWriter, r *http.Req
 
 	// Read body
 	body, err := io.ReadAll(r.Body)
+	// PATCHED (local): optionally dump large request bodies for debugging.
+	// Opt-in only: set AOP_DUMP_REQUESTS=1 (writes full conversation content
+	// to /tmp/aop-dumps — do not enable on shared machines).
+	if os.Getenv("AOP_DUMP_REQUESTS") != "" && len(body) > 50000 {
+		_ = os.MkdirAll("/tmp/aop-dumps", 0700)
+		nm := fmt.Sprintf("/tmp/aop-dumps/%d-%d.json", time.Now().UnixMilli(), len(body))
+		_ = os.WriteFile(nm, body, 0600)
+	}
 	if err != nil {
 		logger.Get().Error().Err(err).Msg("Error reading request body")
 		http.Error(w, "Error reading request body", http.StatusBadRequest)
