@@ -28,12 +28,40 @@ type AvailableModel struct {
 }
 
 func (c *Client) FetchAvailableModels(ctx context.Context) (*FetchAvailableModelsResponse, error) {
+	return c.fetchAvailableModels(ctx, false)
+}
+
+// FetchAvailableModelsForce bypasses the cache and queries the upstream
+// backend, so newly released models show up immediately.
+func (c *Client) FetchAvailableModelsForce(ctx context.Context) (*FetchAvailableModelsResponse, error) {
+	return c.fetchAvailableModels(ctx, true)
+}
+
+// modelsCacheTTL bounds how stale the model listing can get. Kept short on
+// purpose: Google adds new models server-side at any time and the proxy must
+// surface them without a binary update or restart.
+const modelsCacheTTL = 5 * time.Minute
+
+// ModelsCacheAge reports how long ago the cached catalogue was fetched. It
+// returns a huge duration when nothing is cached, so callers can treat "never
+// fetched" as maximally stale.
+func (c *Client) ModelsCacheAge() time.Duration {
 	c.mu.RLock()
-	if c.modelsCache != nil && time.Since(c.modelsCacheTime) < time.Hour {
-		defer c.mu.RUnlock()
-		return c.modelsCache, nil
+	defer c.mu.RUnlock()
+	if c.modelsCache == nil {
+		return time.Duration(1 << 62)
 	}
+	return time.Since(c.modelsCacheTime)
+}
+
+func (c *Client) fetchAvailableModels(ctx context.Context, force bool) (*FetchAvailableModelsResponse, error) {
+	c.mu.RLock()
+	cached := c.modelsCache
+	fresh := c.modelsCache != nil && time.Since(c.modelsCacheTime) < modelsCacheTTL
 	c.mu.RUnlock()
+	if fresh && !force {
+		return cached, nil
+	}
 
 	bodyBytes, err := json.Marshal(map[string]interface{}{})
 	if err != nil {
@@ -75,6 +103,14 @@ func (c *Client) FetchAvailableModels(ctx context.Context) (*FetchAvailableModel
 	}
 
 	if lastErr != nil {
+		// Serve the last-known listing rather than failing: a transient
+		// upstream blip must not hide (new) models from clients.
+		c.mu.RLock()
+		stale := c.modelsCache
+		c.mu.RUnlock()
+		if stale != nil {
+			return stale, nil
+		}
 		return nil, lastErr
 	}
 	return nil, fmt.Errorf("fetchAvailableModels failed with no endpoints available")

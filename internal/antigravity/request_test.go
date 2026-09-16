@@ -44,18 +44,47 @@ func TestPrepareAntigravityRequestMatchesCLIShape(t *testing.T) {
 	if req.Request.SystemInstruction.Role != "user" {
 		t.Fatalf("SystemInstruction.Role = %q, want user", req.Request.SystemInstruction.Role)
 	}
+	// Local fork patch: a client-supplied system instruction is passed through
+	// untouched (no Antigravity identity prompt is prepended), because callers
+	// such as Hermes send their own agent prompt and must not have it polluted.
 	parts := req.Request.SystemInstruction.Parts
-	if len(parts) != 2 {
-		t.Fatalf("SystemInstruction parts = %d, want 2", len(parts))
+	if len(parts) != 1 {
+		t.Fatalf("SystemInstruction parts = %d, want 1 (client instruction untouched)", len(parts))
 	}
-	if !strings.Contains(parts[0].Text, "<identity>") || !strings.Contains(parts[0].Text, "You are Antigravity") {
-		t.Fatalf("first system part does not contain Antigravity identity")
+	if parts[0].Text != "client system" {
+		t.Fatalf("existing system part = %q, want client system", parts[0].Text)
+	}
+	if strings.Contains(parts[0].Text, "<identity>") {
+		t.Fatal("client system part must not have the Antigravity identity prepended")
 	}
 	if strings.Contains(parts[0].Text, "Please ignore the following [ignore]") {
-		t.Fatalf("first system part contains legacy ignore injection")
+		t.Fatal("first system part contains legacy ignore injection")
 	}
-	if parts[1].Text != "client system" {
-		t.Fatalf("existing system part = %q, want client system", parts[1].Text)
+}
+
+func TestPrepareAntigravityRequestInjectsIdentityWhenClientSendsNone(t *testing.T) {
+	req := &GenerateContentRequest{
+		Project: "test-project",
+		Model:   "gemini-pro-agent",
+		Request: GeminiInternalRequest{
+			Contents: []Content{{
+				Role:  "user",
+				Parts: []ContentPart{{Text: "hello"}},
+			}},
+		},
+	}
+
+	prepareAntigravityRequest(req)
+
+	if req.Request.SystemInstruction == nil {
+		t.Fatal("SystemInstruction is nil")
+	}
+	parts := req.Request.SystemInstruction.Parts
+	if len(parts) != 1 {
+		t.Fatalf("SystemInstruction parts = %d, want 1", len(parts))
+	}
+	if !strings.Contains(parts[0].Text, "<identity>") || !strings.Contains(parts[0].Text, "You are Antigravity") {
+		t.Fatalf("system part does not contain the Antigravity identity: %q", parts[0].Text)
 	}
 }
 

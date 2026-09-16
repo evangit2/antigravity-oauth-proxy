@@ -33,9 +33,9 @@ func (s *Server) openAIChatCompletionsHandler(w http.ResponseWriter, r *http.Req
 	// Opt-in only: set AOP_DUMP_REQUESTS=1 (writes full conversation content
 	// to /tmp/aop-dumps — do not enable on shared machines).
 	if os.Getenv("AOP_DUMP_REQUESTS") != "" && len(body) > 50000 {
-		_ = os.MkdirAll("/tmp/aop-dumps", 0700)
+		_ = os.MkdirAll("/tmp/aop-dumps", 0o700)
 		nm := fmt.Sprintf("/tmp/aop-dumps/%d-%d.json", time.Now().UnixMilli(), len(body))
-		_ = os.WriteFile(nm, body, 0600)
+		_ = os.WriteFile(nm, body, 0o600)
 	}
 	if err != nil {
 		logger.Get().Error().Err(err).Msg("Error reading request body")
@@ -109,27 +109,35 @@ func (s *Server) openAIChatCompletionsHandler(w http.ResponseWriter, r *http.Req
 		Int("tool_messages", toolMsgCount).
 		Msg("Tool result message count")
 
-	// Check if model exists, if not fallback to default agent model
+	// Check if model exists, if not fallback to default agent model.
+	//
+	// A miss against our catalog may simply mean the catalog is stale: Google
+	// adds models server-side at any time. Force one upstream refresh before
+	// substituting a fallback, so a model released minutes ago is not silently
+	// swapped out for an older one.
 	data, err := s.antigravityClient.FetchAvailableModels(r.Context())
 	if err == nil {
 		resolvedModel := resolveModelForThinking(req.Model, antigravity.GeminiInternalRequest{})
-		if _, exists := data.Models[req.Model]; !exists {
-			if _, existsResolved := data.Models[resolvedModel]; !existsResolved {
-				fallbackModel := "gemini-3.7-flash-high"
-				if data.DefaultAgentModelID != "" {
-					if _, existsDefault := data.Models[data.DefaultAgentModelID]; existsDefault {
-						fallbackModel = data.DefaultAgentModelID
-					}
-				} else if _, existsFallback := data.Models[fallbackModel]; !existsFallback {
-					fallbackModel = "gemini-3.5-flash-extra-low"
+		if !catalogOffersModel(data, req.Model) && !catalogOffersModel(data, resolvedModel) {
+			// Only pay for that extra upstream call when the cached catalogue
+			// is old enough for a recent release to plausibly be missing:
+			// callers sending unknown IDs in a loop must not turn every request
+			// into an upstream fetch.
+			if s.antigravityClient.ModelsCacheAge() >= modelMissRefreshInterval {
+				if fresh, ferr := s.antigravityClient.FetchAvailableModelsForce(r.Context()); ferr == nil {
+					data = fresh
+					resolvedModel = resolveModelForThinking(req.Model, antigravity.GeminiInternalRequest{})
 				}
-				logger.Get().Warn().
-					Str("requested_model", req.Model).
-					Str("resolved_model", resolvedModel).
-					Str("fallback_model", fallbackModel).
-					Msg("Requested model is unknown. Normalizing to fallback model.")
-				req.Model = fallbackModel
 			}
+		}
+		if !catalogOffersModel(data, req.Model) && !catalogOffersModel(data, resolvedModel) {
+			fallbackModel := pickFallbackModel(data)
+			logger.Get().Warn().
+				Str("requested_model", req.Model).
+				Str("resolved_model", resolvedModel).
+				Str("fallback_model", fallbackModel).
+				Msg("Requested model is unknown. Normalizing to fallback model.")
+			req.Model = fallbackModel
 		}
 	} else {
 		logger.Get().Warn().Err(err).Msg("Failed to fetch available models to validate requested model")
