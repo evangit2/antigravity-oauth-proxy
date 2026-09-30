@@ -27,6 +27,29 @@ type AvailableModel struct {
 	QuotaInfo   json.RawMessage `json:"quotaInfo,omitempty"`
 }
 
+// QuotaStatus is Google's per-model allowance: how much of the current
+// window is left and when it resets.
+type QuotaStatus struct {
+	RemainingFraction float64 `json:"remaining_fraction"`
+	ResetTime         string  `json:"reset_time,omitempty"`
+}
+
+// ParsedQuota decodes the upstream quotaInfo blob. ok is false when upstream
+// sent nothing usable.
+func (m AvailableModel) ParsedQuota() (q QuotaStatus, ok bool) {
+	if len(m.QuotaInfo) == 0 {
+		return QuotaStatus{}, false
+	}
+	var raw struct {
+		RemainingFraction *float64 `json:"remainingFraction"`
+		ResetTime         string   `json:"resetTime"`
+	}
+	if err := json.Unmarshal(m.QuotaInfo, &raw); err != nil || raw.RemainingFraction == nil {
+		return QuotaStatus{}, false
+	}
+	return QuotaStatus{RemainingFraction: *raw.RemainingFraction, ResetTime: raw.ResetTime}, true
+}
+
 func (c *Client) FetchAvailableModels(ctx context.Context) (*FetchAvailableModelsResponse, error) {
 	return c.fetchAvailableModels(ctx, false)
 }

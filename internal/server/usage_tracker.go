@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dvcrn/antigravity-oauth-proxy/internal/antigravity"
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/env"
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/logger"
 )
@@ -45,6 +46,11 @@ type UsageSummary struct {
 	TotalTokens      int                    `json:"total_tokens"`
 	ByModel          map[string]*ModelUsage `json:"by_model"`
 	ByDay            map[string]*ModelUsage `json:"by_day"`
+	// Tier is the account's current upstream plan (e.g. "Antigravity (free-tier)").
+	Tier string `json:"tier,omitempty"`
+	// Quota is Google's per-model allowance: fraction remaining in the
+	// current window plus reset time. Absent when upstream is unreachable.
+	Quota map[string]antigravity.QuotaStatus `json:"quota,omitempty"`
 }
 
 // UsageTracker records per-request token usage to a JSONL file and serves
@@ -161,14 +167,44 @@ func (t *UsageTracker) Summary() UsageSummary {
 	return s
 }
 
-// usageHandler serves GET /admin/usage with the aggregated usage summary.
+// usageHandler serves GET /admin/usage: locally recorded token consumption
+// plus Google's per-model quota (fraction remaining + reset time) and the
+// account tier. Pass ?refresh=1 to force a fresh upstream quota fetch
+// instead of the 5-minute cached catalogue.
 func (s *Server) usageHandler(w http.ResponseWriter, r *http.Request) {
 	if s.usage == nil {
 		http.Error(w, "Usage tracking not initialized", http.StatusInternalServerError)
 		return
 	}
+	summary := s.usage.Summary()
+
+	var models *antigravity.FetchAvailableModelsResponse
+	var err error
+	if r.URL.Query().Get("refresh") == "1" {
+		models, err = s.antigravityClient.FetchAvailableModelsForce(r.Context())
+	} else {
+		models, err = s.antigravityClient.FetchAvailableModels(r.Context())
+	}
+	if err == nil && models != nil {
+		quota := make(map[string]antigravity.QuotaStatus, len(models.Models))
+		for id, m := range models.Models {
+			if q, ok := m.ParsedQuota(); ok {
+				quota[id] = q
+			}
+		}
+		summary.Quota = quota
+	} else {
+		logger.Get().Warn().Err(err).Msg("Usage: upstream quota fetch failed")
+	}
+
+	if ca, err := s.antigravityClient.LoadCodeAssist(); err == nil {
+		summary.Tier = ca.CurrentTier.Name + " (" + ca.CurrentTier.ID + ")"
+	} else {
+		logger.Get().Warn().Err(err).Msg("Usage: LoadCodeAssist failed")
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.usage.Summary())
+	_ = json.NewEncoder(w).Encode(summary)
 }
 
 // toInt converts JSON-decoded numbers (float64/int/json.Number) to int.
