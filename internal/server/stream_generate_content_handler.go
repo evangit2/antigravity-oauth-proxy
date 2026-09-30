@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/antigravity"
@@ -128,6 +129,22 @@ func (s *Server) handleGenerateContent(w http.ResponseWriter, r *http.Request, m
 	logger.Get().Debug().
 		Dur("api_call_duration", time.Since(apiCallStart)).
 		Msg("GenerateContent successful")
+
+	if s.usage != nil && resp != nil && resp.Response != nil {
+		if um, ok := resp.Response["usageMetadata"].(map[string]interface{}); ok {
+			p, c, th, tot := parseUsageMetadata(um)
+			if p+c+tot > 0 {
+				s.usage.Record(UsageEntry{
+					Model:            resolvedModel,
+					Endpoint:         "generateContent",
+					PromptTokens:     p,
+					CompletionTokens: c,
+					ThoughtTokens:    th,
+					TotalTokens:      tot,
+				})
+			}
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -279,6 +296,7 @@ func (s *Server) handleStreamGenerateContent(w http.ResponseWriter, r *http.Requ
 
 	// Stream loop: transform data lines and forward to client
 	firstWrite := true
+	var sPrompt, sComp, sThoughts, sTotal int
 	// Send SSE keepalives until first upstream byte to avoid idle timeouts
 	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
@@ -303,6 +321,20 @@ streamLoop:
 
 			// Transform CloudCode SSE line into standard Gemini format
 			transformed := TransformSSELine(line)
+
+			// Best-effort usage accounting: the final chunk(s) carry usageMetadata
+			if payload := strings.TrimSpace(strings.TrimPrefix(transformed, "data: ")); strings.HasPrefix(payload, "{") {
+				var obj map[string]interface{}
+				if err := json.Unmarshal([]byte(payload), &obj); err == nil {
+					if um, ok := obj["usageMetadata"].(map[string]interface{}); ok {
+						p, c, th, tot := parseUsageMetadata(um)
+						sPrompt += p
+						sComp += c
+						sThoughts += th
+						sTotal += tot
+					}
+				}
+			}
 
 			// Write transformed line and a newline; upstream blank lines will pass through too
 			if _, err := fmt.Fprintf(w, "%s\n", transformed); err != nil {
@@ -336,6 +368,17 @@ streamLoop:
 		Dur("total_duration", time.Since(startTime)).
 		Dur("api_call_duration", time.Since(apiCallStart)).
 		Msg("streamGenerateContent completed")
+	if s.usage != nil && (sPrompt+sComp+sTotal > 0) {
+		s.usage.Record(UsageEntry{
+			Model:            resolvedModel,
+			Endpoint:         "streamGenerateContent",
+			Stream:           true,
+			PromptTokens:     sPrompt,
+			CompletionTokens: sComp,
+			ThoughtTokens:    sThoughts,
+			TotalTokens:      sTotal,
+		})
+	}
 }
 
 func logGeminiThinkingConfig(context string, requestedModel string, resolvedModel string, req antigravity.GeminiInternalRequest) {

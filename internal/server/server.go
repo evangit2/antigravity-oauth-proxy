@@ -20,6 +20,7 @@ type Server struct {
 	projectID         string
 	mux               *http.ServeMux
 	antigravityClient *antigravity.Client
+	usage             *UsageTracker
 }
 
 // NewServer creates a new server instance with the given credentials provider
@@ -30,6 +31,7 @@ func NewServer(provider credentials.CredentialsProvider, projectID string) *Serv
 		projectID:         projectID,
 		mux:               http.NewServeMux(),
 		antigravityClient: antigravity.NewClient(provider),
+		usage:             NewUsageTracker(),
 	}
 	s.setupRoutes()
 
@@ -121,6 +123,7 @@ func (s *Server) startTokenRefreshLoop() {
 func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("/admin/credentials", s.adminMiddleware(s.credentialsHandler))
 	s.mux.HandleFunc("/admin/credentials/status", s.adminMiddleware(s.credentialsStatusHandler))
+	s.mux.HandleFunc("/admin/usage", s.adminMiddleware(s.usageHandler))
 	s.mux.HandleFunc("/v1beta/models/", s.adminMiddleware(s.streamGenerateContentHandler))
 	s.mux.HandleFunc("/v1/models/", s.modelsHandler)
 	s.mux.HandleFunc("/v1/models", s.modelsHandler)

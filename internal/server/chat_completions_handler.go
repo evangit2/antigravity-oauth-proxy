@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dvcrn/antigravity-oauth-proxy/internal/antigravity"
@@ -223,6 +224,10 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 
 	// Adapter: CloudCode SSE -> StreamChunk (model text, tool calls, usage, etc.)
 	chunkIn := make(chan openai.StreamChunk, 32)
+	// Accumulated upstream token counts for usage tracking (set by the
+	// adapter goroutine below, read after the stream completes).
+	var streamPrompt, streamComp, streamThoughts, streamTotal int
+	var streamUsageMu sync.Mutex
 	go func() {
 		defer close(chunkIn)
 		firstUpstream := true
@@ -272,6 +277,13 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 					payload["outputTokens"] = v
 				}
 				chunkIn <- openai.StreamChunk{Type: "usage", Data: payload}
+				p, c, th, tot := parseUsageMetadata(um)
+				streamUsageMu.Lock()
+				streamPrompt += p
+				streamComp += c
+				streamThoughts += th
+				streamTotal += tot
+				streamUsageMu.Unlock()
 			}
 
 			// Extract candidate content parts
@@ -443,6 +455,19 @@ func (s *Server) chatCompletionRequestStream(w http.ResponseWriter, r *http.Requ
 		Str("model", gemReq.Model).
 		Dur("total_duration", time.Since(startTime)).
 		Msg("OpenAI streaming response completed")
+	streamUsageMu.Lock()
+	if s.usage != nil && (streamPrompt+streamComp+streamTotal > 0) {
+		s.usage.Record(UsageEntry{
+			Model:            gemReq.Model,
+			Endpoint:         "chat_completions",
+			Stream:           true,
+			PromptTokens:     streamPrompt,
+			CompletionTokens: streamComp,
+			ThoughtTokens:    streamThoughts,
+			TotalTokens:      streamTotal,
+		})
+	}
+	streamUsageMu.Unlock()
 }
 
 // chatCompletionRequest handles the non-streaming variant via GenerateContent and returns OpenAI-style JSON.
@@ -537,21 +562,24 @@ func (s *Server) chatCompletionRequest(w http.ResponseWriter, r *http.Request, r
 		},
 	}
 
-	// Include usage if available
+	// Include usage if available (and record it for /admin/usage)
 	if resp != nil && resp.Response != nil {
 		if um, ok := resp.Response["usageMetadata"].(map[string]interface{}); ok {
-			prompt := 0
-			comp := 0
-			if v, ok := um["promptTokenCount"].(float64); ok {
-				prompt = int(v)
-			}
-			if v, ok := um["candidatesTokenCount"].(float64); ok {
-				comp = int(v)
-			}
+			prompt, comp, thoughts, total := parseUsageMetadata(um)
 			openAIResp["usage"] = map[string]interface{}{
 				"prompt_tokens":     prompt,
 				"completion_tokens": comp,
-				"total_tokens":      prompt + comp,
+				"total_tokens":      total,
+			}
+			if s.usage != nil {
+				s.usage.Record(UsageEntry{
+					Model:            gemReq.Model,
+					Endpoint:         "chat_completions",
+					PromptTokens:     prompt,
+					CompletionTokens: comp,
+					ThoughtTokens:    thoughts,
+					TotalTokens:      total,
+				})
 			}
 		}
 	}
